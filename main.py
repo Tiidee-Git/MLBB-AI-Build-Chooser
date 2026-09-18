@@ -1,17 +1,19 @@
 import os
 import threading
 import time
+from typing import List
 
 from kivy.app import App
-from kivy.clock import Clock
 from kivy.lang import Builder
 from kivy.metrics import dp
 from kivy.uix.boxlayout import BoxLayout
 
 try:
-    from jnius import autoclass
+    from jnius import autoclass, PythonJavaClass, java_method
 except ImportError:  # pragma: no cover
     autoclass = None
+    PythonJavaClass = object
+    java_method = lambda *args, **kwargs: (lambda func: func)
 
 
 Builder.load_string(
@@ -87,139 +89,219 @@ Builder.load_string(
 )
 
 
-class MLBBOverlayRoot(BoxLayout):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self._overlay_active = False
-        self._overlay_thread = None
-        self._overlay_window = None
+class ThreatMatrix:
+    def __init__(self):
+        self.vectors = [
+            {'enemy': 'Lunox', 'priority': 94, 'text': 'Sea Halberd (Anti-Regen)'},
+            {'enemy': 'Valir', 'priority': 88, 'text': "Athena's Shield (Magic Burst Counter)"},
+            {'enemy': 'Masha', 'priority': 72, 'text': 'Oracle (Sustain + Team Peel)'},
+            {'enemy': 'Chou', 'priority': 81, 'text': 'Radiant Armor (Anti-Engage Burst)'},
+            {'enemy': 'Kagura', 'priority': 90, 'text': 'Dominance Ice (Utility Slow Counter)'},
+            {'enemy': 'Balmond', 'priority': 76, 'text': 'Brute Force Breastplate (Frontline Counter)'},
+        ]
 
-    def activate_overlay(self):
-        if self._overlay_active:
+    def current_recommendation(self, tick_index: int):
+        ordered = sorted(self.vectors, key=lambda item: item['priority'], reverse=True)
+        return ordered[tick_index % len(ordered)]['text']
+
+
+class OverlayTouchListener(PythonJavaClass):
+    __javainterfaces__ = ['android/view/View$OnTouchListener']
+
+    def __init__(self, bridge):
+        super().__init__()
+        self.bridge = bridge
+        self.last_x = 0.0
+        self.last_y = 0.0
+
+    @java_method('(Landroid/view/View;Landroid/view/MotionEvent;)Z')
+    def onTouch(self, view, event):
+        action = event.getActionMasked()
+        raw_x = event.getRawX()
+        raw_y = event.getRawY()
+
+        if action == 0:
+            self.last_x = raw_x
+            self.last_y = raw_y
+            return True
+
+        if action == 2:
+            dx = raw_x - self.last_x
+            dy = raw_y - self.last_y
+            self.last_x = raw_x
+            self.last_y = raw_y
+            self.bridge.move_overlay(dx, dy)
+            return True
+
+        if action == 1:
+            return True
+
+        return False
+
+
+class AndroidOverlayBridge:
+    def __init__(self):
+        self.running = False
+        self.activity = None
+        self.window_manager = None
+        self.overlay_container = None
+        self.overlay_hud = None
+        self.overlay_params = None
+        self.threat_matrix = ThreatMatrix()
+        self.drag_offset_x = 0.0
+        self.drag_offset_y = 0.0
+        self._thread = None
+
+    def attach_activity(self):
+        if autoclass is None:
             return
+        activity_cls = autoclass('org.kivy.android.PythonActivity')
+        self.activity = activity_cls.mActivity
 
-        self._overlay_active = True
-        self.ids.activate_button.text = 'Overlay Active'
-        self.ids.activate_button.disabled = True
-
-        self._overlay_thread = threading.Thread(target=self._launch_overlay, daemon=True)
-        self._overlay_thread.start()
-
-    def _launch_overlay(self):
-        if self._is_android():
-            self._request_system_overlay_permission()
-        self._create_native_hud()
-
-    def _is_android(self):
-        return os.name == 'posix' and os.environ.get('KIVY_BUILD') == 'android'
-
-    def _request_system_overlay_permission(self):
+    def request_overlay_permission(self):
+        if autoclass is None or self.activity is None:
+            return
+        permission = 'android.permission.SYSTEM_ALERT_WINDOW'
         try:
-            if autoclass is None:
-                return
-            PythonActivity = autoclass('org.kivy.android.PythonActivity')
-            activity = PythonActivity.mActivity
-            if activity is None:
-                return
-            permission = 'android.permission.SYSTEM_ALERT_WINDOW'
-            if activity.checkSelfPermission(permission) != 0:
-                activity.requestPermissions([permission], 101)
+            if self.activity.checkSelfPermission(permission) != 0:
+                self.activity.requestPermissions([permission], 101)
         except Exception:
             pass
 
-    def _create_native_hud(self):
-        if autoclass is None:
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        self.attach_activity()
+        self._thread = threading.Thread(target=self._overlay_worker, daemon=True)
+        self._thread.start()
+
+    def _overlay_worker(self):
+        self.request_overlay_permission()
+        self._build_native_overlay()
+        self._update_loop()
+
+    def _build_native_overlay(self):
+        if autoclass is None or self.activity is None:
             return
 
         try:
-            PythonActivity = autoclass('org.kivy.android.PythonActivity')
-            activity = PythonActivity.mActivity
-            if activity is None:
-                return
+            window_service = self.activity.getSystemService('window')
+            layout_params_class = autoclass('android.view.WindowManager$LayoutParams')
+            gravity_class = autoclass('android.view.Gravity')
+            color_class = autoclass('android.graphics.Color')
+            pixel_format_class = autoclass('android.graphics.PixelFormat')
+            linear_layout_class = autoclass('android.widget.LinearLayout')
+            text_view_class = autoclass('android.widget.TextView')
 
-            window_service = activity.getSystemService('window')
-            layout_params = autoclass('android.view.WindowManager$LayoutParams')
-            gravity = autoclass('android.view.Gravity')
-            color = autoclass('android.graphics.Color')
-            text_view = autoclass('android.widget.TextView')
-            linear_layout = autoclass('android.widget.LinearLayout')
-            type_value = getattr(layout_params, 'TYPE_APPLICATION_OVERLAY')
-            flag_not_focusable = getattr(layout_params, 'FLAG_NOT_FOCUSABLE')
-            flag_not_touch_modal = getattr(layout_params, 'FLAG_NOT_TOUCH_MODAL')
-            params = layout_params(
-                type_value,
-                flag_not_focusable | flag_not_touch_modal,
+            params = layout_params_class(
+                getattr(layout_params_class, 'TYPE_APPLICATION_OVERLAY'),
+                getattr(layout_params_class, 'FLAG_NOT_FOCUSABLE') | getattr(layout_params_class, 'FLAG_NOT_TOUCH_MODAL'),
                 0
             )
-            params.format = getattr(layout_params, 'FORMAT_TRANSLUCENT')
-            params.gravity = gravity.TOP | gravity.START
+            params.format = pixel_format_class.TRANSLUCENT
+            params.gravity = gravity_class.TOP | gravity_class.START
             params.x = 80
-            params.y = 80
+            params.y = 120
             params.width = -2
             params.height = -2
 
-            container = linear_layout(activity)
+            container = linear_layout_class(self.activity)
             container.setOrientation(1)
-            container.setPadding(18, 10, 18, 10)
-            container.setBackgroundColor(color.argb(140, 10, 32, 18))
+            container.setPadding(20, 12, 20, 12)
+            container.setBackgroundColor(color_class.argb(140, 10, 25, 18))
 
-            hud = text_view(activity)
+            hud = text_view_class(self.activity)
             hud.setText('Sea Halberd (Anti-Regen)')
-            hud.setTextColor(color.argb(255, 90, 255, 140))
+            hud.setTextColor(color_class.argb(255, 90, 255, 140))
             hud.setTextSize(18)
-            hud.setShadowLayer(2.5, 0, 0, color.argb(255, 0, 255, 120))
-            hud.setTypeface(self._get_typeface())
+            hud.setShadowLayer(4.0, 0.0, 0.0, color_class.argb(255, 0, 255, 110))
+            hud.setBackgroundColor(color_class.argb(120, 10, 25, 18))
             hud.setPadding(18, 10, 18, 10)
-            hud.setBackgroundColor(color.argb(120, 5, 20, 18))
             hud.setSingleLine(False)
+            hud.setTypeface(self._get_font())
 
+            listener = OverlayTouchListener(self)
+            hud.setOnTouchListener(listener)
             container.addView(hud)
-            window_service.addView(container, params)
 
-            self._overlay_window = container
-            self._overlay_hud = hud
-            self._overlay_params = params
-            self._overlay_window_manager = window_service
-            self._start_hud_updater(hud)
+            self.window_manager = window_service
+            self.overlay_container = container
+            self.overlay_hud = hud
+            self.overlay_params = params
+
+            self.activity.runOnUiThread(lambda: self.window_manager.addView(self.overlay_container, self.overlay_params))
+            self._apply_text('Sea Halberd (Anti-Regen)')
         except Exception:
             pass
 
-    def _get_typeface(self):
+    def _get_font(self):
         try:
             if autoclass is None:
                 return None
-            typeface = autoclass('android.graphics.Typeface')
-            return typeface.create('monospace', typeface.BOLD)
+            typeface_class = autoclass('android.graphics.Typeface')
+            return typeface_class.create('monospace', typeface_class.BOLD)
         except Exception:
             return None
 
-    def _start_hud_updater(self, hud):
-        recommendations = [
-            'Sea Halberd (Anti-Regen)',
-            "Athena's Shield (Magic Burst Counter)",
-            'Oracle (Sustain + Team Peel)',
-            'Radiant Armor (Anti-Spell Burst)',
-            'Dominance Ice (Utility Slow Counter)',
-            'Brute Force Breastplate (Frontline Counter)',
-        ]
+    def _apply_text(self, value):
+        if self.overlay_hud is None or self.activity is None:
+            return
 
-        def update_loop():
-            while self._overlay_active:
-                index = int(time.time() // 5) % len(recommendations)
-                next_text = recommendations[index]
-                Clock.schedule_once(lambda dt, text=next_text: self._safe_ui_text_update(hud, text), 0)
-                time.sleep(5)
+        def ui_update():
+            try:
+                self.overlay_hud.setText(value)
+            except Exception:
+                pass
 
-        self._updater_thread = threading.Thread(target=update_loop, daemon=True)
-        self._updater_thread.start()
+        self.activity.runOnUiThread(ui_update)
 
-    def _safe_ui_text_update(self, view, text):
-        try:
-            if view is None:
-                return
-            view.setText(text)
-        except Exception:
-            pass
+    def move_overlay(self, dx, dy):
+        if self.overlay_params is None or self.window_manager is None:
+            return
+
+        self.overlay_params.x += int(dx)
+        self.overlay_params.y += int(dy)
+
+        def update_layout():
+            try:
+                self.window_manager.updateViewLayout(self.overlay_container, self.overlay_params)
+            except Exception:
+                pass
+
+        if self.activity is not None:
+            self.activity.runOnUiThread(update_layout)
+
+    def _update_loop(self):
+        tick = 0
+        while self.running:
+            text = self.threat_matrix.current_recommendation(tick)
+            self._apply_text(text)
+            tick += 1
+            time.sleep(5)
+
+    def stop(self):
+        self.running = False
+        if self.window_manager is not None and self.overlay_container is not None:
+            try:
+                self.window_manager.removeView(self.overlay_container)
+            except Exception:
+                pass
+
+
+class MLBBOverlayRoot(BoxLayout):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._overlay_started = False
+        self.overlay_bridge = AndroidOverlayBridge()
+
+    def activate_overlay(self):
+        if self._overlay_started:
+            return
+        self._overlay_started = True
+        self.ids.activate_button.text = 'Overlay Active'
+        self.ids.activate_button.disabled = True
+        threading.Thread(target=self.overlay_bridge.start, daemon=True).start()
 
 
 class MLBBAIChooserApp(App):
@@ -235,10 +317,12 @@ class MLBBAIChooserApp(App):
         try:
             if autoclass is None:
                 return
-            PythonActivity = autoclass('org.kivy.android.PythonActivity')
-            activity = PythonActivity.mActivity
+            activity_cls = autoclass('org.kivy.android.PythonActivity')
+            activity = activity_cls.mActivity
+            if activity is None:
+                return
             permission = 'android.permission.SYSTEM_ALERT_WINDOW'
-            if activity is not None and activity.checkSelfPermission(permission) != 0:
+            if activity.checkSelfPermission(permission) != 0:
                 activity.requestPermissions([permission], 101)
         except Exception:
             pass
